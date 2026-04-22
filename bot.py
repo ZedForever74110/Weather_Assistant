@@ -70,7 +70,7 @@ def get_outfit_advice(city, temp, humidity, wind, weather_desc):
         f"请给出简洁的今日穿搭建议，包括上衣、下装、外套（如需）、鞋子，约80字，直接给建议。"
     )
     resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_KEY}",
         json={"contents": [{"parts": [{"text": prompt}]}]},
         timeout=15
     )
