@@ -69,12 +69,37 @@ def get_outfit_advice(city, temp, humidity, wind, weather_desc):
         f"今天{city}天气：{weather_desc}，温度{temp}℃，湿度{humidity}%，风速{wind}km/h。"
         f"请给出简洁的今日穿搭建议，包括上衣、下装、外套（如需）、鞋子，约80字，直接给建议。"
     )
-    resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_KEY}",
-        json={"contents": [{"parts": [{"text": prompt}]}]},
-        timeout=15
-    )
-    return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_KEY}",
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=100
+        )
+        data = resp.json()
+        if "candidates" in data:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            # Gemini 失败时用简单规则兜底
+            return fallback_outfit(temp, weather_desc)
+    except Exception as e:
+        return fallback_outfit(temp, weather_desc)
+
+def fallback_outfit(temp, desc):
+    if temp < 5:
+        base = "羽绒服 + 厚毛衣 + 长裤 + 保暖靴，围巾手套必备"
+    elif temp < 12:
+        base = "大衣或厚外套 + 毛衣 + 长裤 + 休闲皮鞋"
+    elif temp < 18:
+        base = "风衣或夹克 + 长袖 + 牛仔裤 + 运动鞋"
+    elif temp < 24:
+        base = "轻薄卫衣或衬衫 + 长裤 + 运动鞋"
+    elif temp < 28:
+        base = "短袖T恤 + 薄长裤或裙装 + 帆布鞋"
+    else:
+        base = "短袖短裤 + 透气凉鞋，注意防晒"
+    if "雨" in desc:
+        base += "，别忘带伞 ☂️"
+    return base
 
 async def send_daily_outfit(app):
     loc = load_location()
