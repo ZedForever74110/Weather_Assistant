@@ -10,9 +10,12 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+if not TOKEN:
+    raise ValueError("TELEGRAM_TOKEN 未设置")
 LOCATION_FILE = "location.json"
 
 WEATHER_DESC = {
