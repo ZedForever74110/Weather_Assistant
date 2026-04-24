@@ -3,7 +3,9 @@ import json
 import asyncio
 import requests
 import logging
-from datetime import datetime
+import random
+import time
+from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -16,7 +18,12 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 if not TOKEN:
     raise ValueError("TELEGRAM_TOKEN 未设置")
+
 LOCATION_FILE = "location.json"
+FOOD_HISTORY_FILE = "food_history.json"
+
+TIME_SLOTS = [9, 12, 18, 22]
+TIME_LABELS = {9: "早上", 12: "中午", 18: "傍晚", 22: "夜晚"}
 
 WEATHER_DESC = {
     0:"晴天",1:"大部晴朗",2:"局部多云",3:"阴天",
@@ -42,6 +49,25 @@ def save_location(lat, lon):
     with open(LOCATION_FILE, "w") as f:
         json.dump({"lat": lat, "lon": lon}, f)
 
+def load_food_history():
+    if os.path.exists(FOOD_HISTORY_FILE):
+        with open(FOOD_HISTORY_FILE) as f:
+            return json.load(f)
+    return []
+
+def save_food(name):
+    history = load_food_history()
+    history.append({"name": name, "time": datetime.now().isoformat()})
+    cutoff = datetime.now() - timedelta(days=7)
+    history = [h for h in history if datetime.fromisoformat(h["time"]) > cutoff]
+    with open(FOOD_HISTORY_FILE, "w") as f:
+        json.dump(history, f, ensure_ascii=False)
+
+def get_recent_foods(days=3):
+    history = load_food_history()
+    cutoff = datetime.now() - timedelta(days=days)
+    return [h["name"] for h in history if datetime.fromisoformat(h["time"]) > cutoff]
+
 def get_city_name(lat, lon):
     try:
         r = requests.get(
@@ -54,99 +80,286 @@ def get_city_name(lat, lon):
     except:
         return "当前位置"
 
-def get_weather(lat, lon):
+def get_hourly_weather(lat, lon):
     url = (
         f"https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
-        f"&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code"
+        f"&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code"
+        f"&forecast_days=1"
         f"&timezone=auto"
     )
-    c = requests.get(url, timeout=10).json()["current"]
-    return c["temperature_2m"], c["relative_humidity_2m"], round(c["wind_speed_10m"]), c["weather_code"]
+    for attempt in range(3):
+        try:
+            data = requests.get(url, timeout=20).json()
+            hourly = data["hourly"]
+            result = {}
+            for i, t in enumerate(hourly["time"]):
+                hour = int(t.split("T")[1].split(":")[0])
+                result[hour] = {
+                    "temp": hourly["temperature_2m"][i],
+                    "code": hourly["weather_code"][i],
+                    "humidity": hourly["relative_humidity_2m"][i],
+                    "wind": round(hourly["wind_speed_10m"][i])
+                }
+            return result
+        except Exception as e:
+            if attempt == 2:
+                raise
+            time.sleep(2)
 
-def get_outfit_advice(city, temp, humidity, wind, weather_desc):
+def get_current_weather(lat, lon):
+    url = (
+        f"https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        f"&current=temperature_2m,weather_code"
+        f"&timezone=auto"
+    )
+    for attempt in range(3):
+        try:
+            c = requests.get(url, timeout=20).json()["current"]
+            return c["temperature_2m"], c["weather_code"]
+        except Exception as e:
+            if attempt == 2:
+                raise
+            time.sleep(2)
+
+def find_nearby_restaurants(lat, lon, radius=800):
+    query = f"""
+    [out:json][timeout:10];
+    (
+      node["amenity"="restaurant"](around:{radius},{lat},{lon});
+      node["amenity"="cafe"](around:{radius},{lat},{lon});
+      node["amenity"="fast_food"](around:{radius},{lat},{lon});
+    );
+    out body 30;
+    """
+    try:
+        r = requests.post("https://overpass-api.de/api/interpreter", data={"data": query}, timeout=15)
+        elements = r.json().get("elements", [])
+        restaurants = []
+        for e in elements:
+            tags = e.get("tags", {})
+            name = tags.get("name") or tags.get("name:zh") or tags.get("name:en")
+            if not name:
+                continue
+            restaurants.append({
+                "name": name,
+                "cuisine": tags.get("cuisine", "").replace("_", " ").replace(";", ", "),
+                "amenity": tags.get("amenity", ""),
+                "lat": e.get("lat"),
+                "lon": e.get("lon")
+            })
+        return restaurants
+    except Exception as e:
+        logging.error(f"Overpass API error: {e}")
+        return []
+
+def get_day_outfit_advice(city, slots_data):
+    slots_str = "\n".join([
+        f"- {TIME_LABELS[h]} {h}:00: {t}℃，{d}"
+        for h, t, d in slots_data
+    ])
+    temps = [t for _, t, _ in slots_data]
+    temp_range = f"{min(temps):.0f}°C 到 {max(temps):.0f}°C"
+
     prompt = (
-        f"今天{city}天气：{weather_desc}，温度{temp}℃，湿度{humidity}%，风速{wind}km/h。"
-        f"请给出简洁的今日穿搭建议，包括上衣、下装、外套（如需）、鞋子，约80字，直接给建议。"
+        f"今天{city}全天温度分布：\n{slots_str}\n"
+        f"全天温差 {temp_range}。\n\n"
+        f"请给出一套保险的核心穿搭（以中位温度为基准），再给2-3条加减衣提示。\n"
+        f"格式：\n"
+        f"👗 *核心搭配*\n（一句话描述上衣+下装+鞋子+外套）\n\n"
+        f"⏱ *加减时机*\n• ...\n• ...\n\n"
+        f"简洁直接，不用多余客套。"
     )
     try:
         resp = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_KEY}",
             json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=100
+            timeout=15
         )
         data = resp.json()
         if "candidates" in data:
             return data["candidates"][0]["content"]["parts"][0]["text"]
-        else:
-            # Gemini 失败时用简单规则兜底
-            return fallback_outfit(temp, weather_desc)
     except Exception as e:
-        return fallback_outfit(temp, weather_desc)
+        logging.error(f"Gemini 穿搭失败: {e}")
+    return fallback_day_outfit(slots_data)
 
-def fallback_outfit(temp, desc):
-    if temp < 5:
-        base = "羽绒服 + 厚毛衣 + 长裤 + 保暖靴，围巾手套必备"
-    elif temp < 12:
-        base = "大衣或厚外套 + 毛衣 + 长裤 + 休闲皮鞋"
-    elif temp < 18:
-        base = "风衣或夹克 + 长袖 + 牛仔裤 + 运动鞋"
-    elif temp < 24:
-        base = "轻薄卫衣或衬衫 + 长裤 + 运动鞋"
-    elif temp < 28:
-        base = "短袖T恤 + 薄长裤或裙装 + 帆布鞋"
+def fallback_day_outfit(slots_data):
+    temps = [t for _, t, _ in slots_data]
+    median = sorted(temps)[len(temps)//2]
+    diff = max(temps) - min(temps)
+
+    if median < 5:
+        base = "羽绒服 + 厚毛衣 + 长裤 + 保暖靴"
+    elif median < 12:
+        base = "大衣 + 毛衣 + 长裤 + 休闲鞋"
+    elif median < 18:
+        base = "风衣 + 长袖 + 牛仔裤 + 运动鞋"
+    elif median < 24:
+        base = "薄卫衣或衬衫 + 长裤 + 运动鞋"
     else:
-        base = "短袖短裤 + 透气凉鞋，注意防晒"
-    if "雨" in desc:
-        base += "，别忘带伞 ☂️"
-    return base
+        base = "短袖 + 薄长裤 + 帆布鞋"
+
+    tips = []
+    if diff >= 8:
+        tips.append(f"温差较大（{diff:.0f}°C），外套早晚必备")
+    coldest = min(slots_data, key=lambda x: x[1])
+    hottest = max(slots_data, key=lambda x: x[1])
+    tips.append(f"{coldest[0]}:00 最冷（{coldest[1]:.0f}°C），加衣")
+    tips.append(f"{hottest[0]}:00 最暖（{hottest[1]:.0f}°C），可减衣")
+
+    tips_str = "\n".join([f"• {t}" for t in tips])
+    return f"👗 *核心搭配*\n{base}\n\n⏱ *加减时机*\n{tips_str}"
+
+def pick_restaurant_with_ai(restaurants, meal_type, weather_desc, temp, recent_foods):
+    if not restaurants:
+        return None, "附近没找到餐厅 😢"
+    rest_list = "\n".join([
+        f"- {r['name']}" + (f"（{r['cuisine']}）" if r['cuisine'] else "")
+        for r in restaurants[:25]
+    ])
+    recent_str = "、".join(recent_foods) if recent_foods else "无"
+    prompt = (
+        f"我现在要吃{meal_type}，今天天气{weather_desc}，温度{temp}℃。\n"
+        f"最近吃过（请避免类似）：{recent_str}\n\n"
+        f"附近餐厅候选：\n{rest_list}\n\n"
+        f"请从上面选一家推荐给我，并用1-2句话说明为什么适合现在。\n"
+        f"格式：\n**餐厅名**\n推荐理由"
+    )
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_KEY}",
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=15
+        )
+        data = resp.json()
+        if "candidates" in data:
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            matched = None
+            for r in restaurants:
+                if r["name"] in text:
+                    matched = r
+                    break
+            return matched, text
+    except Exception as e:
+        logging.error(f"Gemini 餐厅推荐失败: {e}")
+    chosen = random.choice(restaurants[:10])
+    return chosen, f"**{chosen['name']}**\n随机为你选了这家 🎲"
 
 async def send_daily_outfit(app):
     loc = load_location()
     if not loc:
         await app.bot.send_message(
             chat_id=CHAT_ID,
-            text="📍 还没有你的位置信息！\n请在 Telegram 里发送你的位置给我，之后每天会自动推送穿搭建议。"
+            text="📍 还没有你的位置信息！请在 Telegram 里发送你的位置给我。"
         )
         return
-
     try:
         lat, lon = loc["lat"], loc["lon"]
         city = get_city_name(lat, lon)
-        temp, humidity, wind, code = get_weather(lat, lon)
-        desc = WEATHER_DESC.get(code, "未知天气")
-        emoji = WEATHER_EMOJI.get(code, "🌡️")
-        advice = get_outfit_advice(city, temp, humidity, wind, desc)
+        hourly = get_hourly_weather(lat, lon)
+
+        slots_data = []
+        slots_display = []
+        for h in TIME_SLOTS:
+            if h in hourly:
+                d = hourly[h]
+                desc = WEATHER_DESC.get(d["code"], "未知")
+                emoji = WEATHER_EMOJI.get(d["code"], "🌡")
+                slots_data.append((h, d["temp"], desc))
+                slots_display.append(
+                    f"⏰ `{h:02d}:00`  {emoji}  *{d['temp']:.0f}°C*  {desc}"
+                )
+
+        temps = [t for _, t, _ in slots_data]
+        temp_diff = max(temps) - min(temps)
+
+        advice = get_day_outfit_advice(city, slots_data)
 
         msg = (
-            f"{emoji} *{city} 今日穿搭建议*\n\n"
-            f"🌡 温度：{temp}°C　💧 湿度：{humidity}%　💨 风速：{wind} km/h\n"
-            f"天气：{desc}\n\n"
-            f"👗 *穿搭建议*\n{advice}"
+            f"🗓 *{city} 今日全天天气*\n\n"
+            + "\n".join(slots_display)
+            + f"\n\n📊 全天温差：*{temp_diff:.0f}°C*（{min(temps):.0f}° ~ {max(temps):.0f}°）\n\n"
+            + advice
         )
         await app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
     except Exception as e:
         await app.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ 获取天气失败：{e}")
+
+async def send_meal_recommendation(app, meal_type):
+    loc = load_location()
+    if not loc:
+        await app.bot.send_message(chat_id=CHAT_ID, text="📍 还没有位置信息！")
+        return
+    try:
+        lat, lon = loc["lat"], loc["lon"]
+        temp, code = get_current_weather(lat, lon)
+        desc = WEATHER_DESC.get(code, "未知天气")
+        restaurants = find_nearby_restaurants(lat, lon)
+        recent = get_recent_foods()
+        chosen, text = pick_restaurant_with_ai(restaurants, meal_type, desc, temp, recent)
+        emoji = "🍜" if meal_type == "午餐" else "🍽"
+        msg = f"{emoji} *今日{meal_type}推荐*\n\n{text}"
+        if chosen:
+            maps_url = f"https://www.google.com/maps/search/?api=1&query={chosen['lat']},{chosen['lon']}"
+            msg += f"\n\n📍 [在地图中查看]({maps_url})"
+            msg += f"\n\n吃完后发 `/ate {chosen['name']}` 记录"
+        await app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        await app.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ 获取餐厅失败：{e}")
 
 async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc = update.message.location
     save_location(loc.latitude, loc.longitude)
     city = get_city_name(loc.latitude, loc.longitude)
     await update.message.reply_text(
-        f"✅ 位置已更新为：{city}\n每天早上 7:00 会根据这里的天气推送穿搭建议！"
+        f"✅ 位置已更新：{city}\n"
+        f"每天 07:00 推送全天天气穿搭计划。"
     )
 
 async def handle_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ 正在获取天气和穿搭建议…")
+    await update.message.reply_text("⏳ 正在获取全天天气穿搭…")
     await send_daily_outfit(context.application)
+
+async def handle_lunch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🍜 正在挑午餐…")
+    await send_meal_recommendation(context.application, "午餐")
+
+async def handle_dinner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🍽 正在挑晚餐…")
+    await send_meal_recommendation(context.application, "晚餐")
+
+async def handle_ate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("用法：/ate 菜名或餐厅名")
+        return
+    name = " ".join(context.args)
+    save_food(name)
+    await update.message.reply_text(f"✅ 已记录：{name}")
+
+async def handle_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    recent = get_recent_foods(days=7)
+    if not recent:
+        await update.message.reply_text("📝 最近7天还没有记录")
+    else:
+        text = "📝 *最近7天吃过*：\n\n" + "\n".join([f"• {f}" for f in recent])
+        await update.message.reply_text(text, parse_mode="Markdown")
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 你好！我是你的每日穿搭助手。\n\n"
-        "📍 发送你的位置给我，我会每天早上 7:00 自动推送当地天气和穿搭建议。\n\n"
-        "指令：\n"
-        "/now — 立即获取今日穿搭建议\n"
-        "发送位置 — 更新你的位置"
+        "👋 你好！我是你的生活助手\n\n"
+        "📍 发送位置给我（每次到新城市发一次）\n\n"
+        "*指令：*\n"
+        "/now — 获取全天天气穿搭计划\n"
+        "/lunch — 午餐推荐\n"
+        "/dinner — 晚餐推荐\n"
+        "/ate 菜名 — 记录吃过的\n"
+        "/recent — 查看最近吃过什么\n\n"
+        "*自动推送：*\n"
+        "• 07:00 全天天气 + 穿搭\n"
+        "• 11:30 午餐推荐\n"
+        "• 17:30 晚餐推荐",
+        parse_mode="Markdown"
     )
 
 def main():
@@ -154,15 +367,16 @@ def main():
 
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("now", handle_now))
+    app.add_handler(CommandHandler("lunch", handle_lunch))
+    app.add_handler(CommandHandler("dinner", handle_dinner))
+    app.add_handler(CommandHandler("ate", handle_ate))
+    app.add_handler(CommandHandler("recent", handle_recent))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
 
-    scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
-    scheduler.add_job(
-        send_daily_outfit,
-        "cron",
-        hour=7, minute=0,
-        args=[app]
-    )
+    scheduler = AsyncIOScheduler(timezone="Europe/Paris")
+    scheduler.add_job(send_daily_outfit, "cron", hour=7, minute=0, args=[app])
+    scheduler.add_job(send_meal_recommendation, "cron", hour=11, minute=30, args=[app, "午餐"])
+    scheduler.add_job(send_meal_recommendation, "cron", hour=17, minute=30, args=[app, "晚餐"])
     scheduler.start()
 
     print("Bot 启动成功 ✅")
