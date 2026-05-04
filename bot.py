@@ -187,18 +187,26 @@ def ft_fetch(url, full_article=False):
         return None
 
 def ft_get_section_articles(section_url, max_articles=6):
-    """从板块页提取文章链接和标题"""
     html = ft_fetch(section_url)
     if not html:
+        logging.error(f"❌ 没抓到 HTML: {section_url}")
         return []
     
-    # 提取 <a href="/content/UUID" ... 的标题链接
+    logging.info(f"✅ HTML 长度 {len(html)} for {section_url}")
+    
+    # 检测付费墙/登录页
+    if "Subscribe to read" in html:
+        logging.warning(f"⚠️ 付费墙: {section_url}")
+    if html.count("/content/") < 5:
+        logging.warning(f"⚠️ 内容链接很少 ({html.count('/content/')}个)，可能被拦")
+    
     pattern = r'<a[^>]*href="(/content/[a-f0-9-]+)"[^>]*data-trackable="heading-link"[^>]*>([^<]+)</a>'
     matches = re.findall(pattern, html)
     if not matches:
-        # 备选模式
-        pattern = r'href="(/content/[a-f0-9-]+)"[^>]*>\s*<[^>]+>([^<]+)</'
+        pattern = r'href="(/content/[a-f0-9-]+)"[^>]*aria-label="([^"]+)"'
         matches = re.findall(pattern, html)
+    
+    logging.info(f"📰 匹配到 {len(matches)} 篇文章")
     
     seen = set()
     articles = []
