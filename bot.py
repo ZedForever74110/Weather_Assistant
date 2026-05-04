@@ -5,7 +5,9 @@ import requests
 import logging
 import random
 import time
+import re
 from datetime import datetime, timedelta
+from urllib.parse import urljoin
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -15,6 +17,7 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+FT_COOKIE = os.environ.get("FT_COOKIE", "")
 
 if not TOKEN:
     raise ValueError("TELEGRAM_TOKEN 未设置")
@@ -39,6 +42,15 @@ WEATHER_EMOJI = {
     95:"⛈️",99:"⛈️"
 }
 
+FT_SECTIONS = [
+    ("Markets", "https://www.ft.com/markets"),
+    ("China", "https://www.ft.com/world/asia-pacific/china"),
+    ("Tech", "https://www.ft.com/technology"),
+]
+
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# ---------- 位置管理 ----------
 def load_location():
     if os.path.exists(LOCATION_FILE):
         with open(LOCATION_FILE) as f:
@@ -49,6 +61,7 @@ def save_location(lat, lon):
     with open(LOCATION_FILE, "w") as f:
         json.dump({"lat": lat, "lon": lon}, f)
 
+# ---------- 饮食历史 ----------
 def load_food_history():
     if os.path.exists(FOOD_HISTORY_FILE):
         with open(FOOD_HISTORY_FILE) as f:
@@ -68,6 +81,7 @@ def get_recent_foods(days=3):
     cutoff = datetime.now() - timedelta(days=days)
     return [h["name"] for h in history if datetime.fromisoformat(h["time"]) > cutoff]
 
+# ---------- 位置与天气 ----------
 def get_city_name(lat, lon):
     try:
         r = requests.get(
@@ -123,7 +137,8 @@ def get_current_weather(lat, lon):
                 raise
             time.sleep(2)
 
-def find_nearby_restaurants(lat, lon, radius=800):
+# ---------- 附近餐厅 ----------
+def find_nearby_restaurants(lat, lon, radius=2000):
     query = f"""
     [out:json][timeout:10];
     (
@@ -154,6 +169,125 @@ def find_nearby_restaurants(lat, lon, radius=800):
         logging.error(f"Overpass API error: {e}")
         return []
 
+# ---------- FT 抓取 ----------
+def ft_fetch(url, full_article=False):
+    """获取 FT 页面 HTML"""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if FT_COOKIE:
+        headers["Cookie"] = FT_COOKIE
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+        return r.text if r.status_code == 200 else None
+    except Exception as e:
+        logging.error(f"FT fetch error {url}: {e}")
+        return None
+
+def ft_get_section_articles(section_url, max_articles=6):
+    """从板块页提取文章链接和标题"""
+    html = ft_fetch(section_url)
+    if not html:
+        return []
+    
+    # 提取 <a href="/content/UUID" ... 的标题链接
+    pattern = r'<a[^>]*href="(/content/[a-f0-9-]+)"[^>]*data-trackable="heading-link"[^>]*>([^<]+)</a>'
+    matches = re.findall(pattern, html)
+    if not matches:
+        # 备选模式
+        pattern = r'href="(/content/[a-f0-9-]+)"[^>]*>\s*<[^>]+>([^<]+)</'
+        matches = re.findall(pattern, html)
+    
+    seen = set()
+    articles = []
+    for href, title in matches:
+        if href in seen:
+            continue
+        seen.add(href)
+        title_clean = re.sub(r'\s+', ' ', title).strip()
+        if len(title_clean) < 10:
+            continue
+        articles.append({
+            "url": urljoin("https://www.ft.com", href),
+            "title": title_clean
+        })
+        if len(articles) >= max_articles:
+            break
+    return articles
+
+def ft_get_article_text(url):
+    """提取文章正文"""
+    html = ft_fetch(url, full_article=True)
+    if not html:
+        return ""
+    # FT 文章正文在 <div class="article__content-body"> 或 <article> 标签内的 <p>
+    paragraphs = re.findall(r'<p[^>]*>(.*?)</p>', html, re.DOTALL)
+    text_parts = []
+    for p in paragraphs:
+        clean = re.sub(r'<[^>]+>', '', p).strip()
+        clean = re.sub(r'\s+', ' ', clean)
+        if len(clean) > 40:
+            text_parts.append(clean)
+    return "\n".join(text_parts[:15])  # 最多前15段
+
+def ft_collect_articles():
+    """采集所有板块的文章"""
+    all_articles = []
+    for section_name, section_url in FT_SECTIONS:
+        logging.info(f"抓取 FT {section_name}...")
+        articles = ft_get_section_articles(section_url, max_articles=5)
+        for a in articles:
+            a["section"] = section_name
+            # 抓正文（每篇控制一下避免太慢）
+            a["body"] = ft_get_article_text(a["url"])[:3000]
+            all_articles.append(a)
+            time.sleep(0.5)
+    return all_articles
+
+def ft_summarize(articles):
+    """用 Gemini 汇总成3个主题"""
+    if not articles:
+        return "今天没抓到文章 😢 可能 cookie 失效了"
+
+    articles_text = "\n\n".join([
+        f"[{a['section']}] {a['title']}\nURL: {a['url']}\n{a['body'][:1500]}"
+        for a in articles
+    ])
+
+    prompt = (
+        f"以下是今天 Financial Times 的多篇文章（来自 Markets、China、Tech 三个板块）。\n\n"
+        f"{articles_text}\n\n"
+        f"请用中文为我总结今天最重要的 **3 个主题**。每个主题要求：\n"
+        f"1. 用一句话点出核心趋势/事件\n"
+        f"2. 用 2-3 句话展开背景和影响\n"
+        f"3. 列出涉及的 1-2 篇相关文章标题\n\n"
+        f"格式严格按照：\n"
+        f"📌 *主题1：xxx*\n"
+        f"核心：xxxx\n"
+        f"展开：xxxx\n"
+        f"相关：[文章标题1] / [文章标题2]\n\n"
+        f"📌 *主题2：xxx*\n"
+        f"...\n\n"
+        f"风格简洁专业，中文表达自然。"
+    )
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_KEY}",
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=30
+        )
+        data = resp.json()
+        if "candidates" in data:
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        logging.error(f"Gemini 返回: {data}")
+        return "AI 汇总失败 😢"
+    except Exception as e:
+        logging.error(f"FT 汇总失败: {e}")
+        return f"AI 汇总失败：{e}"
+
+# ---------- AI 全天穿搭建议 ----------
 def get_day_outfit_advice(city, slots_data):
     slots_str = "\n".join([
         f"- {TIME_LABELS[h]} {h}:00: {t}℃，{d}"
@@ -211,6 +345,7 @@ def fallback_day_outfit(slots_data):
     tips_str = "\n".join([f"• {t}" for t in tips])
     return f"👗 *核心搭配*\n{base}\n\n⏱ *加减时机*\n{tips_str}"
 
+# ---------- AI 餐厅推荐 ----------
 def pick_restaurant_with_ai(restaurants, meal_type, weather_desc, temp, recent_foods):
     if not restaurants:
         return None, "附近没找到餐厅 😢"
@@ -246,6 +381,7 @@ def pick_restaurant_with_ai(restaurants, meal_type, weather_desc, temp, recent_f
     chosen = random.choice(restaurants[:10])
     return chosen, f"**{chosen['name']}**\n随机为你选了这家 🎲"
 
+# ---------- 任务 ----------
 async def send_daily_outfit(app):
     loc = load_location()
     if not loc:
@@ -308,14 +444,31 @@ async def send_meal_recommendation(app, meal_type):
     except Exception as e:
         await app.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ 获取餐厅失败：{e}")
 
+async def send_ft_digest(app):
+    try:
+        await app.bot.send_message(chat_id=CHAT_ID, text="📰 正在抓取 FT...")
+        articles = ft_collect_articles()
+        if not articles:
+            await app.bot.send_message(
+                chat_id=CHAT_ID,
+                text="⚠️ 没抓到文章，可能 FT_COOKIE 失效，请更新"
+            )
+            return
+        summary = ft_summarize(articles)
+        # Telegram 单条消息 4096 字符上限
+        msg = f"📰 *Financial Times 今日要闻*\n_{datetime.now().strftime('%Y-%m-%d')}_\n\n{summary}"
+        if len(msg) > 4000:
+            msg = msg[:3950] + "\n\n_（内容已截断）_"
+        await app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        await app.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ FT 汇总失败：{e}")
+
+# ---------- 命令处理 ----------
 async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc = update.message.location
     save_location(loc.latitude, loc.longitude)
     city = get_city_name(loc.latitude, loc.longitude)
-    await update.message.reply_text(
-        f"✅ 位置已更新：{city}\n"
-        f"每天 07:00 推送全天天气穿搭计划。"
-    )
+    await update.message.reply_text(f"✅ 位置已更新：{city}")
 
 async def handle_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ 正在获取全天天气穿搭…")
@@ -345,18 +498,24 @@ async def handle_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "📝 *最近7天吃过*：\n\n" + "\n".join([f"• {f}" for f in recent])
         await update.message.reply_text(text, parse_mode="Markdown")
 
+async def handle_ft(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📰 正在抓取 FT 并汇总…需要1-2分钟")
+    await send_ft_digest(context.application)
+
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 你好！我是你的生活助手\n\n"
-        "📍 发送位置给我（每次到新城市发一次）\n\n"
+        "👋 你好！我是你的生活 + 财经助手\n\n"
+        "📍 发送位置给我\n\n"
         "*指令：*\n"
-        "/now — 获取全天天气穿搭计划\n"
+        "/now — 获取全天天气穿搭\n"
+        "/ft — 获取今日 FT 重点\n"
         "/lunch — 午餐推荐\n"
         "/dinner — 晚餐推荐\n"
         "/ate 菜名 — 记录吃过的\n"
         "/recent — 查看最近吃过什么\n\n"
         "*自动推送：*\n"
         "• 07:00 全天天气 + 穿搭\n"
+        "• 08:00 FT 财经要闻\n"
         "• 11:30 午餐推荐\n"
         "• 17:30 晚餐推荐",
         parse_mode="Markdown"
@@ -367,6 +526,7 @@ def main():
 
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("now", handle_now))
+    app.add_handler(CommandHandler("ft", handle_ft))
     app.add_handler(CommandHandler("lunch", handle_lunch))
     app.add_handler(CommandHandler("dinner", handle_dinner))
     app.add_handler(CommandHandler("ate", handle_ate))
@@ -375,6 +535,7 @@ def main():
 
     scheduler = AsyncIOScheduler(timezone="Europe/Paris")
     scheduler.add_job(send_daily_outfit, "cron", hour=7, minute=0, args=[app])
+    scheduler.add_job(send_ft_digest, "cron", hour=8, minute=0, args=[app])
     scheduler.add_job(send_meal_recommendation, "cron", hour=11, minute=30, args=[app, "午餐"])
     scheduler.add_job(send_meal_recommendation, "cron", hour=17, minute=30, args=[app, "晚餐"])
     scheduler.start()
